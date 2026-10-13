@@ -1,0 +1,96 @@
+name: Zig 0.17.0 bootstrap reproducibility
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  reproduce:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Record environment and download official source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/results"
+          { uname -a; cc --version; free -h; lscpu; } > results/environment.txt
+          VERSION=0.17.0
+          curl -fL --retry 3 "https://ziglang.org/download/$VERSION/zig-$VERSION.tar.xz" -o "zig-$VERSION.tar.xz"
+          sha256sum "zig-$VERSION.tar.xz" > results/source-sha256.txt
+          tar -xf "zig-$VERSION.tar.xz"
+      - name: Run original bootstrap and stage builds
+        shell: bash
+        run: |
+          set -euxo pipefail
+          RESULTS="$GITHUB_WORKSPACE/results"
+          cd zig-0.17.0
+          VERSION=0.17.0
+          cc -o bootstrap bootstrap.c
+          ./bootstrap 2>&1 | tee "$RESULTS/bootstrap.log"
+          export ZIG_LIB_DIR="$PWD/lib"
+          opts=(-Dversion-string="$VERSION" -Dno-lib -Denable-llvm=false -Duse-llvm=false -Doptimize=ReleaseFast -Dstrip --maxrss 8000000000)
+          ./zig2 build -p stage3 "${opts[@]}" --verbose 2>&1 | tee "$RESULTS/stage3.log"
+          ./stage3/bin/zig version | tee "$RESULTS/stage3-version.txt"
+          ./stage3/bin/zig build -p stage4 "${opts[@]}" --verbose 2>&1 | tee "$RESULTS/stage4.log"
+          ./stage4/bin/zig version | tee "$RESULTS/stage4-version.txt"
+          sha256sum stage3/bin/zig stage4/bin/zig | tee "$RESULTS/hashes.txt"
+          cp stage3/bin/zig "$RESULTS/zig-stage3"
+          cp stage4/bin/zig "$RESULTS/zig-stage4"
+          if cmp stage3/bin/zig stage4/bin/zig > "$RESULTS/stage3-vs-stage4.txt" 2>&1; then
+            echo identical | tee -a "$RESULTS/stage3-vs-stage4.txt"
+            echo 'STAGE3_STAGE4=identical' >> "$GITHUB_ENV"
+          else
+            echo different | tee -a "$RESULTS/stage3-vs-stage4.txt"
+            echo 'STAGE3_STAGE4=different' >> "$GITHUB_ENV"
+          fi
+          for stage in 3 4; do
+            readelf -hSWn "stage$stage/bin/zig" > "$RESULTS/stage$stage-elf.txt"
+            objdump -d "stage$stage/bin/zig" | sha256sum > "$RESULTS/stage$stage-disassembly-sha256.txt"
+          done
+      - name: Diagnose mismatch with repeat builds and stage five
+        if: env.STAGE3_STAGE4 == 'different'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          RESULTS="$GITHUB_WORKSPACE/results"
+          cd zig-0.17.0
+          export ZIG_LIB_DIR="$PWD/lib"
+          opts=(-Dversion-string=0.17.0 -Dno-lib -Denable-llvm=false -Duse-llvm=false -Doptimize=ReleaseFast -Dstrip --maxrss 8000000000)
+          for run in a b; do
+            ZIG_LOCAL_CACHE_DIR="$PWD/cache-repeat-$run" ZIG_GLOBAL_CACHE_DIR="$PWD/global-repeat-$run" \
+              ./stage3/bin/zig build -p "repeat-$run" "${opts[@]}" --verbose 2>&1 | tee "$RESULTS/repeat-$run.log"
+            cp "repeat-$run/bin/zig" "$RESULTS/zig-repeat-$run"
+          done
+          if cmp repeat-a/bin/zig repeat-b/bin/zig > "$RESULTS/repeat-comparison.txt" 2>&1; then
+            echo identical | tee -a "$RESULTS/repeat-comparison.txt"
+          else
+            echo different | tee -a "$RESULTS/repeat-comparison.txt"
+          fi
+          ./stage4/bin/zig build -p stage5 "${opts[@]}" --verbose 2>&1 | tee "$RESULTS/stage5.log"
+          ./stage5/bin/zig version > "$RESULTS/stage5-version.txt"
+          cp stage5/bin/zig "$RESULTS/zig-stage5"
+          if cmp stage4/bin/zig stage5/bin/zig > "$RESULTS/stage4-vs-stage5.txt" 2>&1; then
+            echo identical | tee -a "$RESULTS/stage4-vs-stage5.txt"
+          else
+            echo different | tee -a "$RESULTS/stage4-vs-stage5.txt"
+          fi
+          sha256sum repeat-a/bin/zig repeat-b/bin/zig stage5/bin/zig | tee -a "$RESULTS/hashes.txt"
+      - name: Summarize comparisons
+        if: always()
+        shell: bash
+        run: |
+          for f in results/stage3-vs-stage4.txt results/repeat-comparison.txt results/stage4-vs-stage5.txt results/hashes.txt; do
+            if test -f "$f"; then
+              echo "### $(basename "$f")" >> "$GITHUB_STEP_SUMMARY"
+              echo '```text' >> "$GITHUB_STEP_SUMMARY"
+              cat "$f" >> "$GITHUB_STEP_SUMMARY"
+              echo '```' >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+      - name: Preserve binaries and logs even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zig-0.17.0-reproduction
+          path: results/
+          retention-days: 7
